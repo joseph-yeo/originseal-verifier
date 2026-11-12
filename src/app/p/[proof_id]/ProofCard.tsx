@@ -258,6 +258,14 @@ export default function ProofCard({ proofId, proof, serverVerification, chainEve
               <>
                 <CheckRow label="V1  브라우저 서명 검증" status={clientV1?.status || 'skip'} note={clientV1?.detail} />
                 <CheckRow label="V2  해시체인 재계산" status={clientV2?.status || 'skip'} note={clientV2?.detail} />
+                {(clientV2?.legacyTextHexRows ?? 0) > 0 && (
+                  <div style={{
+                    padding: '8px 18px 10px 62px', fontSize: 11, color: 'var(--text-muted)',
+                    borderBottom: '1px solid var(--border)',
+                  }}>
+                    저장 형식 보정 {clientV2?.legacyTextHexRows}행 — 서버 저장 형식 결함을 읽을 때 해석함 (저장 데이터 변경 없음)
+                  </div>
+                )}
                 {clientV2?.status === 'pass' && clientV2?.summary && (
                   <SessionSummary summary={clientV2.summary} />
                 )}
