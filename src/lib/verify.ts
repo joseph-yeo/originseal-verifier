@@ -4,6 +4,19 @@
 // ADR-018: SHA256(UTF8(hexString)) 공식 준수
 // ADR-021: 클라이언트=온체인 독립 검증
 // ADR-022: fetch + JSON-RPC eth_call만 사용 (ethers.js 번들 금지)
+// ADR-032 / C0: 저장된 체인 해시(bytea)는 읽을 때만 해석한다 (저장 행은 고치지 않음)
+//   서버 originseal-app _shared/stored-hash.ts (A3) 와 같은 규칙. 입력은 PostgREST bytea 문자열(`\x` + hex).
+//   1. 문자열이 아니거나 `\x`로 시작하지 않으면 → invalid
+//   2. 본문이 짝수 길이의 [0-9a-fA-F]* 가 아니면 → invalid
+//   3. 디코드한 바이트 수가 32 → canonical. 해시 = 본문 소문자
+//      64 이고 모든 바이트가 ASCII 0-9 a-f A-F (0x30-39, 0x61-66, 0x41-46) → legacy_text_hex.
+//         해시 = 그 64바이트를 문자열로 읽어 소문자로
+//      그 밖 → invalid
+//   출력: { hex: 소문자 64자 | null, format }
+//   행 분류 (서버 decodeStoredChainRows 와 같음): payload_hash·prev_hash·chain_hash, 값이 있으면 content_hash.
+//   하나라도 invalid → invalid 행, 아니고 하나라도 legacy → legacy 행. invalid 행이 있으면 V2 실패.
+//   원인: A3 이전 session-sync가 bytea에 `\x` 없이 hex 글자를 넣어 64바이트로 저장됨 (진단 F19).
+//   이 파일은 import가 없어야 한다 (verify.test.mjs가 Node로 직접 불러온다).
 
 export interface ChainConfig {
   rpc: string
@@ -59,6 +72,10 @@ export interface V2Result extends VerifyResult {
     started_at: string | null
     ended_at: string | null
   }
+  /** invalid가 없고 해시 열 중 하나라도 legacy_text_hex인 행 수 (ADR-032 읽기 해석) */
+  legacyTextHexRows?: number
+  /** 해시 열 중 하나라도 해석할 수 없는 행 수 */
+  invalidRows?: number
 }
 
 export interface ChainEvent {
@@ -76,6 +93,46 @@ export interface ChainEvent {
 export function normalizeHex(val: unknown): string {
   if (!val || typeof val !== 'string') return ''
   return val.replace(/^(0x|\\\\x|\\x)/, '').toLowerCase()
+}
+
+// ─── Stored Hash Decoding (ADR-032, 서버 stored-hash.ts와 같은 규칙) ──
+export type StoredHashFormat = 'canonical' | 'legacy_text_hex' | 'invalid'
+
+export interface StoredHash {
+  /** 소문자 hex 64자 (32바이트). invalid면 null. */
+  hex: string | null
+  format: StoredHashFormat
+}
+
+/** ASCII hex 글자인 바이트인가: '0'-'9', 'a'-'f', 'A'-'F' */
+function isHexAsciiByte(b: number): boolean {
+  return (b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66) || (b >= 0x41 && b <= 0x46)
+}
+
+/** 저장된 bytea 값을 32바이트 해시(hex 64자)로 해석한다. 예외를 던지지 않는다. */
+export function decodeStoredHash(value: unknown): StoredHash {
+  try {
+    if (typeof value !== 'string' || !value.startsWith('\\x')) return { hex: null, format: 'invalid' }
+    const body = value.slice(2)
+    if (body.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(body)) return { hex: null, format: 'invalid' }
+
+    const byteLength = body.length / 2
+    if (byteLength === 32) {
+      return { hex: body.toLowerCase(), format: 'canonical' }
+    }
+    if (byteLength === 64) {
+      let text = ''
+      for (let i = 0; i < 64; i++) {
+        const b = parseInt(body.substring(i * 2, i * 2 + 2), 16)
+        if (!isHexAsciiByte(b)) return { hex: null, format: 'invalid' }
+        text += String.fromCharCode(b)
+      }
+      return { hex: text.toLowerCase(), format: 'legacy_text_hex' }
+    }
+    return { hex: null, format: 'invalid' }
+  } catch {
+    return { hex: null, format: 'invalid' }
+  }
 }
 
 function hexToBytes(hex: string): Uint8Array {
@@ -204,6 +261,29 @@ export async function verifyChainV2(events: ChainEvent[]): Promise<V2Result> {
   }
 
   const sorted = [...events].sort((a, b) => a.seq - b.seq)
+
+  // ADR-032: 루프 전에 모든 행의 저장 형식을 분류·해석한다 (서버 decodeStoredChainRows와 같음)
+  let legacyTextHexRows = 0, invalidRows = 0
+  const decoded = sorted.map(ev => {
+    const payload = decodeStoredHash(ev.payload_hash)
+    const prev = decodeStoredHash(ev.prev_hash)
+    const chain = decodeStoredHash(ev.chain_hash)
+    const hasContent = ev.content_hash !== null && ev.content_hash !== undefined
+    const parts = [payload, prev, chain, ...(hasContent ? [decodeStoredHash(ev.content_hash)] : [])]
+    if (parts.some(d => d.format === 'invalid')) invalidRows++
+    else if (parts.some(d => d.format === 'legacy_text_hex')) legacyTextHexRows++
+    return { payload: payload.hex ?? '', prev: prev.hex ?? '', chain: chain.hex ?? '' }
+  })
+
+  if (invalidRows > 0) {
+    return {
+      status: 'fail',
+      detail: `저장 형식을 해석할 수 없는 행 ${invalidRows}개`,
+      legacyTextHexRows,
+      invalidRows,
+    }
+  }
+
   let gaps = 0, captures = 0, continuityCount = 0, blanks = 0
   let firstTs: string | null = null
   let lastTs: string | null = null
@@ -223,40 +303,42 @@ export async function verifyChainV2(events: ChainEvent[]): Promise<V2Result> {
 
     // Genesis: prev_hash must be all zeros
     if (i === 0 && evType === 'genesis') {
-      const prevHash = normalizeHex(ev.prev_hash)
+      const prevHash = decoded[i].prev
       if (prevHash !== '0'.repeat(64)) {
-        return { status: 'fail', detail: `genesis prev_hash가 영이 아님 (seq=${ev.seq})` }
+        return { status: 'fail', detail: `genesis prev_hash가 영이 아님 (seq=${ev.seq})`, legacyTextHexRows, invalidRows }
       }
     }
 
     // Chain link: prev_hash must equal previous event's chain_hash
     if (i > 0) {
-      const expectedPrev = normalizeHex(sorted[i - 1].chain_hash)
-      const actualPrev = normalizeHex(ev.prev_hash)
+      const expectedPrev = decoded[i - 1].chain
+      const actualPrev = decoded[i].prev
       if (expectedPrev !== actualPrev) {
-        return { status: 'fail', detail: `해시체인 끊김 — seq=${ev.seq}의 prev_hash 불일치` }
+        return { status: 'fail', detail: `해시체인 끊김 — seq=${ev.seq}의 prev_hash 불일치`, legacyTextHexRows, invalidRows }
       }
     }
 
     // chain_hash = SHA256(UTF8(hex(prev_bytes || payload_bytes || uint32BE(seq) || utf8(ts))))
     // 서버 _shared/verify-chain.ts 와 동일 (DataSchema v1.3 §3.3)
-    const prevBytes = hexToBytes(normalizeHex(ev.prev_hash))
-    const payloadBytes = hexToBytes(normalizeHex(ev.payload_hash))
+    const prevBytes = hexToBytes(decoded[i].prev)
+    const payloadBytes = hexToBytes(decoded[i].payload)
     const seqBytes = uint32BE(ev.seq)
     const tsForHash = ev.ts_utc_raw || ev.ts_utc
     const tsBytes = new TextEncoder().encode(tsForHash)
     const combined = concatBytes(prevBytes, payloadBytes, seqBytes, tsBytes)
     const expectedChainHash = await sha256Hex(bytesToHex(combined))
-    const actualChainHash = normalizeHex(ev.chain_hash)
+    const actualChainHash = decoded[i].chain
 
     if (expectedChainHash !== actualChainHash) {
-      return { status: 'fail', detail: `chain_hash 불일치 — seq=${ev.seq} (${evType})` }
+      return { status: 'fail', detail: `chain_hash 불일치 — seq=${ev.seq} (${evType})`, legacyTextHexRows, invalidRows }
     }
   }
 
   return {
     status: 'pass',
     detail: `${sorted.length}개 이벤트, ${gaps}개 갭, 체인 무결성 통과`,
+    legacyTextHexRows,
+    invalidRows,
     summary: {
       total_events: sorted.length,
       captures,
