@@ -430,7 +430,7 @@ export function evaluateAttestation(
   chainName: string
 ): { status: 'pass' | 'fail' | 'error'; detail: string; attestationTime?: string } {
   const head = decodeAttestationHead(resultHex)
-  if (!head) return { status: 'error', detail: '온체인 응답을 해석할 수 없음' }
+  if (!head) return { status: 'error', detail: '온체인 응답 해석 불가' }
 
   const requested = cleanHex(requestedUid).padStart(64, '0')
   if (/^0+$/.test(head.uid) || head.uid !== requested) {
@@ -439,16 +439,16 @@ export function evaluateAttestation(
 
   const ar = cleanHex(anchorRecordHex)
   if (!/^[0-9a-f]{64}$/.test(ar)) {
-    return { status: 'pass', detail: `온체인 어테스테이션 확인됨 (${chainName}) · anchor_record 대조 안 함` }
+    return { status: 'pass', detail: '온체인 기록 존재 · 대조 안 함' }
   }
 
   if (head.dataFirstWord === null || head.dataFirstWord !== ar) {
-    return { status: 'fail', detail: '온체인 기록이 이 증명의 anchor_record와 일치하지 않음' }
+    return { status: 'fail', detail: '온체인 기록 불일치 (anchor_record)' }
   }
 
   return {
     status: 'pass',
-    detail: `온체인 어테스테이션 확인됨 (${chainName}) · anchor_record 일치`,
+    detail: `온체인 기록 일치 (${chainName})`,
     ...(head.time > 0 ? { attestationTime: new Date(head.time * 1000).toISOString() } : {}),
   }
 }

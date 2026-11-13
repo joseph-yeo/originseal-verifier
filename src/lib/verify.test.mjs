@@ -157,7 +157,7 @@ test('#12 decodeAttestationHead: 해석할 수 없는 입력 → null, 예외 �
 test('#13 evaluateAttestation: R1 + 맞는 UID + 맞는 anchor_record → pass, 시각', () => {
   assert.deepEqual(evaluateAttestation(R1, UID, AR, CHAIN), {
     status: 'pass',
-    detail: '온체인 어테스테이션 확인됨 (Polygon PoS) · anchor_record 일치',
+    detail: '온체인 기록 일치 (Polygon PoS)',
     attestationTime: '2026-11-13T14:13:18.000Z',
   })
 })
@@ -166,7 +166,7 @@ test('#14 evaluateAttestation: UID 표기만 다름 + anchor_record 한 글자 �
   const badAr = AR.slice(0, -1) + (AR.endsWith('7') ? '8' : '7')
   for (const uid of [UID.toUpperCase().replace('0X', '0x'), UID.slice(2), UID.slice(2).toUpperCase()]) {
     assert.deepEqual(evaluateAttestation(R1, uid, badAr, CHAIN), {
-      status: 'fail', detail: '온체인 기록이 이 증명의 anchor_record와 일치하지 않음',
+      status: 'fail', detail: '온체인 기록 불일치 (anchor_record)',
     })
   }
 })
@@ -185,13 +185,13 @@ test('#16 evaluateAttestation: R1 + 다른 UID → fail 미존재', () => {
 test('#17 evaluateAttestation: anchor_record 없음 / 63자 → pass 대조 안 함, 시각 없음', () => {
   for (const ar of [undefined, null, '', AR.slice(1)]) {
     assert.deepEqual(evaluateAttestation(R1, UID, ar, CHAIN), {
-      status: 'pass', detail: '온체인 어테스테이션 확인됨 (Polygon PoS) · anchor_record 대조 안 함',
+      status: 'pass', detail: '온체인 기록 존재 · 대조 안 함',
     })
   }
 })
 
 test('#18 evaluateAttestation: 해석 불가 입력 → error, 예외 없음', () => {
   for (const input of ['0x', null, undefined, 42, '0x1234', {}]) {
-    assert.deepEqual(evaluateAttestation(input, UID, AR, CHAIN), { status: 'error', detail: '온체인 응답을 해석할 수 없음' })
+    assert.deepEqual(evaluateAttestation(input, UID, AR, CHAIN), { status: 'error', detail: '온체인 응답 해석 불가' })
   }
 })
