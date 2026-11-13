@@ -62,6 +62,11 @@ export interface VerifyResult {
   easscan_url?: string
 }
 
+export interface V3Result extends VerifyResult {
+  /** 온체인 어테스테이션의 time (ISO, UTC). UID와 anchor_record가 모두 일치할 때만 채운다 (C1 D1) */
+  attestationTime?: string
+}
+
 export interface V2Result extends VerifyResult {
   summary?: {
     total_events: number
@@ -370,13 +375,92 @@ async function fetchWithRetry(
   }
 }
 
+// ─── V3: getAttestation 응답 해석 (C1) ──────────────────────
+// eth_call 결과는 동적 구조체 하나: 0번 단어 = 오프셋 0x20, 그 뒤 구조체 (1번 단어부터).
+//   1 uid · 2 schema · 3 time · … · 8 attester · 9 revocable · 10 data 오프셋(구조체 시작 기준)
+//   data 길이 단어 = 1 + 오프셋/32, 그다음 단어가 data 첫 칸 (= anchor_record)
+// 없는 UID도 빈 구조체가 돌아온다 (0번 0x20, 10번 0x140, 나머지 0) → uid 대조로 미존재를 가린다.
+export interface AttestationHead {
+  uid: string
+  time: number
+  dataFirstWord: string | null
+}
+
+const TWO_POW_53 = BigInt(2) ** BigInt(53)
+
+/** getAttestation 응답의 앞부분을 읽는다. 해석할 수 없으면 null. 예외를 던지지 않는다. */
+export function decodeAttestationHead(resultHex: unknown): AttestationHead | null {
+  try {
+    if (typeof resultHex !== 'string' || !/^0x[0-9a-fA-F]*$/.test(resultHex)) return null
+    const body = resultHex.slice(2).toLowerCase()
+    if (body.length % 64 !== 0) return null
+    const count = body.length / 64
+    if (count < 11) return null
+    const word = (i: number) => body.slice(i * 64, (i + 1) * 64)
+
+    if (BigInt('0x' + word(0)) !== BigInt(32)) return null
+
+    const timeBig = BigInt('0x' + word(3))
+    if (timeBig >= TWO_POW_53) return null
+
+    let dataFirstWord: string | null = null
+    const offset = BigInt('0x' + word(10))
+    if (offset % BigInt(32) === BigInt(0) && offset < BigInt(count * 32)) {
+      const lenIdx = 1 + Number(offset / BigInt(32))
+      if (lenIdx + 1 < count && BigInt('0x' + word(lenIdx)) >= BigInt(32)) {
+        dataFirstWord = word(lenIdx + 1)
+      }
+    }
+
+    return { uid: word(1), time: Number(timeBig), dataFirstWord }
+  } catch {
+    return null
+  }
+}
+
+function cleanHex(v: unknown): string {
+  return typeof v === 'string' ? v.replace(/^0x/i, '').toLowerCase() : ''
+}
+
+/** 응답을 요청 UID·이 증명의 anchor_record와 대조해 클라이언트 V3 판정을 낸다 (C1 D4). 예외를 던지지 않는다. */
+export function evaluateAttestation(
+  resultHex: unknown,
+  requestedUid: string,
+  anchorRecordHex: string | null | undefined,
+  chainName: string
+): { status: 'pass' | 'fail' | 'error'; detail: string; attestationTime?: string } {
+  const head = decodeAttestationHead(resultHex)
+  if (!head) return { status: 'error', detail: '온체인 응답을 해석할 수 없음' }
+
+  const requested = cleanHex(requestedUid).padStart(64, '0')
+  if (/^0+$/.test(head.uid) || head.uid !== requested) {
+    return { status: 'fail', detail: '온체인 어테스테이션 미존재' }
+  }
+
+  const ar = cleanHex(anchorRecordHex)
+  if (!/^[0-9a-f]{64}$/.test(ar)) {
+    return { status: 'pass', detail: `온체인 어테스테이션 확인됨 (${chainName}) · anchor_record 대조 안 함` }
+  }
+
+  if (head.dataFirstWord === null || head.dataFirstWord !== ar) {
+    return { status: 'fail', detail: '온체인 기록이 이 증명의 anchor_record와 일치하지 않음' }
+  }
+
+  return {
+    status: 'pass',
+    detail: `온체인 어테스테이션 확인됨 (${chainName}) · anchor_record 일치`,
+    ...(head.time > 0 ? { attestationTime: new Date(head.time * 1000).toISOString() } : {}),
+  }
+}
+
 // ─── V3: EAS On-Chain Verification (ethers.js 없이 JSON-RPC 직접 호출) ──
 // Sprint 9-2: chain_id 기반 RPC/EAS 동적 선택
 export async function verifyOnChainV3(
   easUid: string,
-  chainId: number | null | undefined
-): Promise<VerifyResult> {
-  if (!easUid) return { status: 'pending', detail: '앵커링 대기 중' }
+  chainId: number | null | undefined,
+  anchorRecordHex?: string
+): Promise<V3Result> {
+  if (!easUid) return { status: 'pending', detail: '온체인 기록 없음 (eas_uid 없음)' }
 
   const cfg = getChainConfig(chainId)
   if (!cfg) {
@@ -407,9 +491,11 @@ export async function verifyOnChainV3(
       return { status: 'fail', detail: '온체인 어테스테이션 미존재' }
     }
 
+    const evaluated = evaluateAttestation(data, easUid, anchorRecordHex, cfg.name)
+    if (evaluated.status !== 'pass') return evaluated
+
     return {
-      status: 'pass',
-      detail: `온체인 어테스테이션 확인됨 (${cfg.name})`,
+      ...evaluated,
       easscan_url: `${cfg.easscanBase}/${easUid}`,
     }
   } catch (e: unknown) {
