@@ -3,9 +3,13 @@
 import { useState, useEffect } from 'react'
 import {
   verifySignatureV1, verifyChainV2, verifyOnChainV3, verifyOT,
-  normalizeHex, easscanUrl,
-  type VerifyResult, type V2Result, type ChainEvent, type OTPreimage,
+  normalizeHex, easscanUrl, CHAIN_CONFIG,
+  type VerifyResult, type V2Result, type V3Result, type ChainEvent, type OTPreimage,
 } from '@/lib/verify'
+import {
+  computeInterval, describeInterval, pickRecordTime, shouldShowServerTime,
+  pendingAnchorText, recordStateLabel, verifiedTail, gradeBasisLine, gradeRuleLine,
+} from '@/lib/display'
 
 // ─── Types ──────────────────────────────────────────────────
 interface ServerVerification {
@@ -22,7 +26,15 @@ interface ServerVerification {
     v3_eas_anchor?: {
       status: string; detail?: string
       eas_uid?: string; tx_hash?: string; block_number?: number
-      chain?: string; chain_id?: number
+      chain?: string | null; chain_id?: number | null
+      /** 기록 시각. A5 이후 행은 블록 시각, 이전 행은 서버가 완료를 기록한 시각 */
+      anchored_at?: string | null
+      anchoring?: {
+        state?: string
+        attempts?: number
+        next_attempt_at?: string | null
+        last_error?: string | null
+      }
     }
     v4_zk_proof?: { status: string; detail?: string; reason?: string }
     v5_revocation?: { status: string; detail?: string }
@@ -31,6 +43,9 @@ interface ServerVerification {
   overall_result?: string
   trust_grade?: string
   grade_subscores?: Record<string, string>
+  grade_basis?: string | null
+  grade_rule_version?: number | null
+  grade_computed_at?: string | null
   captured_at?: string
   device_model?: string
   device_attestation_level?: number
@@ -74,6 +89,12 @@ function formatKoreanTimestamp(ts: string | null | undefined): string {
   } catch { return ts ?? '—' }
 }
 
+/** CHAIN_CONFIG 이름. 모르는 id는 chain_{id}, 없으면 — */
+function chainLabel(chainId: unknown): string {
+  if (chainId === null || chainId === undefined || chainId === '') return '—'
+  return CHAIN_CONFIG[Number(chainId)]?.name ?? `chain_${chainId}`
+}
+
 function getDeviceLabel(model: string | null | undefined, level: number | null | undefined): string {
   const base = model || '알 수 없는 기기'
   return level === 0 ? `${base} · 하드웨어 서명 ✓` : `${base} · 소프트웨어 서명`
@@ -90,7 +111,7 @@ function shortHex(h: string | null | undefined, len = 10): string {
 export default function ProofCard({ proofId, proof, serverVerification, chainEvents }: Props) {
   const [clientV1, setClientV1] = useState<VerifyResult | null>(null)
   const [clientV2, setClientV2] = useState<V2Result | null>(null)
-  const [clientV3, setClientV3] = useState<VerifyResult | null>(null)
+  const [clientV3, setClientV3] = useState<V3Result | null>(null)
   const [clientOT, setClientOT] = useState<VerifyResult | null>(null)
   const [clientRunning, setClientRunning] = useState(true)
   const [showTechnical, setShowTechnical] = useState(false)
@@ -112,10 +133,10 @@ export default function ProofCard({ proofId, proof, serverVerification, chainEve
       }
 
       if (proof.eas_uid) {
-        const r = await verifyOnChainV3(proof.eas_uid, proof.chain_id ?? null)
+        const r = await verifyOnChainV3(proof.eas_uid, proof.chain_id ?? null, normalizeHex(proof.anchor_record))
         setClientV3(r)
       } else {
-        setClientV3({ status: 'pending', detail: '앵커링 대기 중' })
+        setClientV3({ status: 'pending', detail: '온체인 기록 없음 (eas_uid 없음)' })
       }
 
       if (proof.origin_tag_preimage && proof.origin_tag) {
@@ -144,6 +165,46 @@ export default function ProofCard({ proofId, proof, serverVerification, chainEve
   const attestLevel = serverVerification?.device_attestation_level ?? proof?.device_attestation_level
   const grade = serverVerification?.trust_grade || proof?.trust_grade
 
+  // ─── 블록체인 기록 (C1, ADR-028) ───
+  // 앵커링 상태는 서버 anchoring.state만 쓴다 (D5). 서버 응답이 없으면 "확인 불가"
+  const v3s = sv?.v3_eas_anchor
+  const anchoring = v3s?.anchoring
+  const anchorState = anchoring?.state
+  // 체인: 서버 v3 값. 서버 v3가 없을 때만 proofs.chain_id 원값 (계산하지 않음)
+  const recordChain = chainLabel(v3s ? v3s.chain_id : proof?.chain_id)
+  // 기록 시각: 온체인(UID·anchor_record 대조 통과) → 서버 anchored_at 순 (D1)
+  const record = pickRecordTime(clientV3?.attestationTime, v3s?.anchored_at)
+  const interval = computeInterval(capturedAt, record.time)
+  const showServerTime = shouldShowServerTime(clientV3?.attestationTime, v3s?.anchored_at)
+  const pendingText = pendingAnchorText(
+    anchorState, anchoring?.next_attempt_at ? formatTime(anchoring.next_attempt_at) : null
+  )
+  const verifiedSentence = verifiedTail({
+    gradeBasis: serverVerification?.grade_basis,
+    interval,
+    recordTimeText: formatTime(record.time),
+    chainName: recordChain,
+  })
+  const attempts = anchoring?.attempts
+  const recordRows: { label: string; value: string }[] = [
+    { label: '상태', value: recordStateLabel(anchorState) },
+    { label: '체인', value: recordChain },
+    { label: '기록 시각', value: record.time ? `${formatTime(record.time)} · ${record.source}` : '—' },
+    ...(showServerTime ? [{ label: '서버 기록 시각', value: formatTime(v3s?.anchored_at) }] : []),
+    { label: '촬영~기록 간격', value: describeInterval(interval) },
+    ...(typeof attempts === 'number' && attempts >= 1 ? [{ label: '시도', value: `${attempts}회` }] : []),
+    ...(anchorState === 'retry_scheduled' ? [{ label: '다음 시도', value: formatTime(anchoring?.next_attempt_at) }] : []),
+    ...(anchoring?.last_error ? [{ label: '오류 코드', value: anchoring.last_error }] : []),
+  ]
+
+  const gradeBasisText = gradeBasisLine(
+    serverVerification?.grade_basis, serverVerification?.grade_subscores?.blockchain_anchoring
+  )
+  const gradeRuleText = gradeRuleLine(
+    serverVerification?.grade_rule_version,
+    serverVerification?.grade_computed_at ? formatTime(serverVerification.grade_computed_at) : null
+  )
+
   return (
     <main style={{ minHeight: '100vh', padding: '2rem 1rem', maxWidth: 620, margin: '0 auto' }}>
       {/* Header */}
@@ -161,9 +222,9 @@ export default function ProofCard({ proofId, proof, serverVerification, chainEve
           fontFamily: 'system-ui, -apple-system, sans-serif',
         }}>
           {isVerified
-            ? `✅ 이 사진은 ${formatKoreanTimestamp(capturedAt)}, ${getDeviceLabel(deviceModel, attestLevel)}에서 촬영된 원본입니다. 촬영 이후 변조된 흔적이 없으며, 블록체인에 기록되어 있습니다.`
+            ? `✅ 이 사진은 ${formatKoreanTimestamp(capturedAt)}, ${getDeviceLabel(deviceModel, attestLevel)}에서 촬영된 원본입니다. ${verifiedSentence}`
             : isPending
-            ? `◎ 이 사진은 블록체인 앵커링이 진행 중입니다. 잠시 후 다시 확인해 주세요.`
+            ? pendingText.summary
             : `❌ 이 사진의 원본 검증에 실패했습니다. 변조되었거나 증명 데이터가 손상되었을 수 있습니다.`}
         </div>
       )}
@@ -184,7 +245,7 @@ export default function ProofCard({ proofId, proof, serverVerification, chainEve
                 fontSize: 20, fontWeight: 600,
                 color: isVerified ? 'var(--green)' : isPending ? 'var(--amber)' : 'var(--red)',
               }}>
-                {isVerified ? '원본 확인됨' : isPending ? '앵커링 대기 중' : '검증 실패'}
+                {isVerified ? '원본 확인됨' : isPending ? pendingText.title : '검증 실패'}
               </div>
               <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 3, letterSpacing: '0.06em' }}>
                 {overall}
@@ -203,6 +264,14 @@ export default function ProofCard({ proofId, proof, serverVerification, chainEve
           </div>
         </div>
       )}
+
+      {/* Blockchain Record (C1) */}
+      <SectionLabel>블록체인 기록</SectionLabel>
+      <div style={{ ...cardStyle, marginBottom: 20 }}>
+        {recordRows.map((row, i) => (
+          <DetailRow key={row.label} label={row.label} value={row.value} last={i === recordRows.length - 1} />
+        ))}
+      </div>
 
       {/* Technical Details Toggle */}
       <button
@@ -312,13 +381,17 @@ export default function ProofCard({ proofId, proof, serverVerification, chainEve
                 </span>
               ))}
             </div>
+            <div style={{ marginTop: 12, fontSize: 11, lineHeight: 1.6, color: 'var(--text-muted)' }}>
+              <div>{gradeBasisText}</div>
+              {gradeRuleText && <div>{gradeRuleText}</div>}
+            </div>
           </div>
         </>
       )}
 
       {/* Footer */}
       <div style={{ fontSize: 11, color: 'var(--text-muted)', textAlign: 'center', paddingTop: 16 }}>
-        {`Sprint 9 · ${process.env.NEXT_PUBLIC_EAS_NETWORK === 'mainnet' ? 'Polygon Mainnet' : 'Sepolia Testnet'} · GRANARY Works`}
+        OriginSeal Verifier · GRANARY Works
       </div>
 
       <style>{`
